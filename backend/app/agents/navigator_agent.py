@@ -1,57 +1,47 @@
-# app/agents/navigator_agent.py
-import asyncio
-from playwright.async_api import async_playwright, Page, Browser, TimeoutError
-import logging
-from typing import Optional, Callable
+from __future__ import annotations
+from typing import List, Dict, Any
+from ..schemas import Product
+from ..services.browser import navigate_and_extract
 
-logger = logging.getLogger(__name__)
 
-async def _auto_scroll(page: Page, scroll_delay: float = 0.15, max_scrolls: int = 30):
-    # scroll down to trigger lazy loads
-    for _ in range(max_scrolls):
-        await page.evaluate("window.scrollBy(0, window.innerHeight)")
-        await asyncio.sleep(scroll_delay)
+def _augment_query(query: str, constraints: Dict[str, Any] | None) -> str:
+    """
+    Build a category-agnostic query that works across sites.
+    We lightly append useful tokens (category, brands) without overfitting.
+    """
+    if not constraints:
+        return query
 
-class NavigatorAgent:
-    def __init__(self, headless: bool = True, slow_mo: int = 0, user_agent: Optional[str] = None):
-        self.headless = headless
-        self.slow_mo = slow_mo
-        self.user_agent = user_agent
-        self._playwright = None
-        self._browser: Optional[Browser] = None
+    tokens: list[str] = []
 
-    async def __aenter__(self):
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=self.headless, args=["--no-sandbox"], slow_mo=self.slow_mo)
-        return self
+    # Add inferred category (electronics, fashion, home-kitchen, etc.) if present
+    category = constraints.get("category")
+    if isinstance(category, str) and category:
+        tokens.append(category)
 
-    async def __aexit__(self, exc_type, exc, tb):
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
+    # Add brand hints if any
+    filters = constraints.get("filters") or {}
+    brands = filters.get("brand") or []
+    if isinstance(brands, list):
+        tokens.extend([b for b in brands if isinstance(b, str)])
 
-    async def fetch_listing_html(self, url: str, wait_for_selector: Optional[str] = None, timeout: int = 30000) -> str:
-        """Open page, wait for selector (if provided), auto-scroll and return HTML content."""
-        context = await self._browser.new_context(user_agent=self.user_agent)
-        page = await context.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            # small random sleep to mimic human behavior
-            await asyncio.sleep(0.6)
-            if wait_for_selector:
-                try:
-                    await page.wait_for_selector(wait_for_selector, timeout=12000)
-                except TimeoutError:
-                    logger.debug("wait_for_selector timed out: %s", wait_for_selector)
-            # auto scroll to load lazy items
-            await _auto_scroll(page)
-            await asyncio.sleep(0.6)
-            html = await page.content()
-            return html
-        finally:
-            try:
-                await page.close()
-            except:
-                pass
-            await context.close()
+    # Keep it simple and robust for generic search pages
+    if tokens:
+        return f"{query} " + " ".join(tokens)
+    return query
+
+
+async def run(
+    query: str,
+    sites: List[str],
+    constraints: Dict[str, Any] | None = None,
+) -> List[Product]:
+    """
+    Navigator agent:
+      - Augments the free-text query with light hints (category/brand)
+      - Delegates real-time scraping to Playwright via services.browser
+      - Returns a unified list[Product] from all requested sites
+    """
+    q = _augment_query(query, constraints)
+    # Pass constraints through so the browser/extractors can optionally use them
+    return await navigate_and_extract(q, sites, constraints=constraints)

@@ -1,9 +1,18 @@
 fastapi
 uvicorn[standard]
 pydantic
-playwright
-beautifulsoup4
-requests
+typing-extensions
+
+# Orchestration
 langchain
 langgraph
-openai
+
+# Browser automation / scraping
+playwright
+beautifulsoup4
+
+# Ranking / fuzzy match
+rapidfuzz
+
+# (Optional) If you later add LLM summaries via OpenAI or others, add their SDKs here
+# openai==1.*

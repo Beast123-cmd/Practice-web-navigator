@@ -1,61 +1,52 @@
-# backend/app/main.py
-from fastapi import FastAPI
+from __future__ import annotations
+from typing import Dict, Any
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List
-from playwright.async_api import async_playwright
 
-app = FastAPI()
+from .schemas import SearchRequest, SearchResponse, Product
+from .adapters.ui_mapper import map_many
+from .pipelines.search_pipeline import run_pipeline
 
-# CORS for frontend
+app = FastAPI(title="Web Navigator AI", version="0.4.0")
+
+# Loosen CORS for dev; restrict in prod (set your frontend origin).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],          # e.g., ["http://localhost:5173", "https://yourdomain.com"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class SearchRequest(BaseModel):
-    query: str
-    mode: str = "search"
-    preference: str = "default"
 
-class ProductResult(BaseModel):
-    name: str
-    price: str
-    rating: float
-    specifications: List[str]
-    link: str
-    image: str
+@app.post("/api/search", response_model=SearchResponse)
+async def search(req: SearchRequest) -> SearchResponse:
+    """
+    Chatbot entrypoint:
+      - Runs the 5-agent LangGraph pipeline (parser → navigator → extractor → ranker → summarizer)
+      - Maps internal products to UI-friendly objects for your React pages
+    """
+    try:
+        state: Dict[str, Any] = await run_pipeline(
+            query=req.query,
+            max_price=req.max_price,
+            sites=req.sites,
+            k=req.k,
+            category_hint=req.category_hint,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pipeline failed: {e}")
 
-async def scrape_amazon(query: str) -> List[dict]:
-    results = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        search_url = f"https://www.amazon.in/s?k={query.replace(' ', '+')}"
-        await page.goto(search_url)
+    ranked: list[Product] = state.get("ranked", [])
+    ui_results = map_many(ranked)
 
-        # Grab first 5 results
-        items = await page.query_selector_all("div.s-main-slot div[data-asin]:has(h2)")
-        for item in items[:5]:
-            title = await item.query_selector_eval("h2 a span", "el => el.textContent") if await item.query_selector("h2 a span") else "N/A"
-            price = await item.query_selector_eval(".a-price-whole", "el => el.textContent") if await item.query_selector(".a-price-whole") else "N/A"
-            link = await item.query_selector_eval("h2 a", "el => el.href") if await item.query_selector("h2 a") else "#"
-            image = await item.query_selector_eval("img.s-image", "el => el.src") if await item.query_selector("img.s-image") else ""
-            results.append({
-                "name": title.strip(),
-                "price": f"₹{price.strip()}" if price != "N/A" else "N/A",
-                "rating": 0,  # Amazon rating scraping can be added
-                "specifications": [],
-                "link": link,
-                "image": image
-            })
-        await browser.close()
-    return results
-
-@app.post("/api/search")
-async def search(req: SearchRequest):
-    products = await scrape_amazon(req.query)
-    return {"summary": f"Found {len(products)} products for {req.query}", "products": products}
+    return SearchResponse(
+        top_k=ranked,                         # internal objects (debug/advanced UI)
+        results=ui_results,                   # UI-friendly results (your React pages consume this)
+        summary=state.get("summary", ""),
+        debug={
+            "constraints": state.get("constraints"),
+            "raw_count": len(state.get("raw_results", [])),
+            "sites": state.get("sites"),
+        },
+    )
